@@ -1,0 +1,134 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim.lr_scheduler import CyclicLR
+#from torch.optim.lr_scheduler as lr_scheduler
+import numpy as np
+import torch.nn.functional as F
+import random
+from model_ddpg import Policy
+from copy import deepcopy
+from torch.autograd import Variable
+
+
+
+class DDPGCarla(object):
+     
+    def __init__(self ,
+                  observation_space,
+                  action_space,                 
+                  batch_size ,
+                  polyak ,
+                  gamma,
+                  base_rl=None,                 
+                  lr=None , 
+                  eps=None ,
+                  replay_size=None ,):
+          self.observation_space=observation_space
+          self.action_space=action_space
+          self.replay_size=replay_size
+          self.batch_size=batch_size
+          self.polyak=polyak
+          self.gamma=gamma
+        
+          self.model=Policy(self.observation_space,
+                                self.action_space).to("cuda:1")
+          self.targ_model=deepcopy(self.model)
+          self.optimizer = optim.Adam(self.model.parameters(), lr=lr, eps=eps)
+          self.rl_scheduler = CyclicLR(self.optimizer,base_lr=base_rl, max_lr=lr,cycle_momentum=False) 
+          self.replay_buffer= ReplayBuffer(replay_size)
+          self.act_limit=self.action_space.high[0]
+
+    # Set up function for computing DDPG Q-loss
+
+    
+    def get_action(self, inputs, noise_scale):
+        img_tensor=torch.FloatTensor(inputs['img'].astype(float)).to("cuda:1")        
+        img_tensor = Variable(torch.unsqueeze(img_tensor, dim=0).float(), requires_grad=False)
+        img_tensor=torch.transpose(img_tensor,1,3)
+        v_tensor= torch.FloatTensor(inputs['v'].astype(float)).to("cuda:1")
+        v_tensor = Variable(torch.unsqueeze(v_tensor, dim=0).float(), requires_grad=False)
+        action=self.model.action(img_tensor,v_tensor)
+        action=action.detach().cpu().numpy()
+        action += noise_scale * np.random.randn(self.model.num_outputs)
+        return np.clip(action, -self.act_limit, self.act_limit)
+
+    def get_targ_value(self,inputs):
+        img_tensor= []
+        v_tensor= []
+        for tensor in inputs:
+            img_tensor.append(tensor['img'])
+            v_tensor.append(tensor['v'])
+        img_tensor=np.array(img_tensor)
+        v_tensor=np.array(v_tensor) 
+        img_tensor=torch.FloatTensor(img_tensor.astype(float)).to("cuda:1")        
+        img_tensor=torch.transpose(img_tensor,1,3)
+        v_tensor= torch.FloatTensor(v_tensor.astype(float)).to("cuda:1")       
+        return self.targ_model.get_value(img_tensor,v_tensor)
+    def get_value(self, inputs):
+        img_tensor= []
+        v_tensor= []
+        for tensor in inputs:
+            img_tensor.append(tensor['img'])
+            v_tensor.append(tensor['v'])
+        img_tensor=np.array(img_tensor)
+        v_tensor=np.array(v_tensor)               
+        img_tensor=torch.FloatTensor(img_tensor.astype(float)).to("cuda:1")        
+        img_tensor=torch.transpose(img_tensor,1,3)
+        v_tensor= torch.FloatTensor(v_tensor.astype(float)).to("cuda:1")      
+        
+        return self.model.get_value(img_tensor, v_tensor)
+
+    def compute_loss_q(self,obs,next_obs,reward,done):
+    
+        q =self. get_value(obs)
+        with torch.no_grad():
+            q_targ = self.get_targ_value(next_obs)
+            backup = reward + self.gamma * (1 - done) * q_targ
+        loss_q = ((q - backup.detach())**2-q).mean()
+        loss_info = dict(QVals=q.cpu().detach().numpy())
+        return loss_q, loss_info   
+    
+    def update(self):
+        for i in range(1):       
+            if len(self.replay_buffer) < self.batch_size:
+                    return
+            obs, action, reward, next_obs, done = self.replay_buffer.sample(
+                     self.batch_size)          
+            action = torch.FloatTensor(action).to("cuda:1")
+            reward = torch.FloatTensor(reward).unsqueeze(1).to("cuda:1")
+            done = torch.FloatTensor(np.float32(done)).unsqueeze(1).to("cuda:1")       
+            self.optimizer.zero_grad()
+            loss_q, loss_info = self.compute_loss_q(obs,next_obs,reward,done)
+            loss_q.backward()      
+            self.optimizer.step()
+            self.rl_scheduler.step()  
+            with torch.no_grad():
+                  for p, p_targ in zip(self.model.parameters(), self.targ_model.parameters()):                
+                        p_targ.data.mul_(self.polyak)
+                        p_targ.data.add_((1 - self.polyak) * p.data)
+
+    
+
+   
+##Buffer
+class ReplayBuffer:
+    
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.buffer = []
+        self.position = 0
+    
+    def push(self, state, action, reward, next_state, done):
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(None)
+        self.buffer[self.position] = (state, action, reward, next_state, done)
+        self.position = (self.position + 1) % self.capacity
+    
+    def sample(self, batch_size):
+        batch = random.sample(self.buffer, batch_size)
+        state_batch, action_batch, reward_batch, next_state_batch, done_batch = map(np.stack, zip(*batch))
+        return state_batch, action_batch, reward_batch, next_state_batch, done_batch
+    
+    def __len__(self):
+        return len(self.buffer)
